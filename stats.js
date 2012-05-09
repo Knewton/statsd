@@ -3,22 +3,68 @@ var dgram  = require('dgram')
   , net    = require('net')
   , config = require('./config')
   , fs     = require('fs')
+  , events = require('events')
 
 var keyCounter = {};
 var counters = {};
 var timers = {};
+var gauges = {};
 var raws = [];
 var averages = {};
-var gauges = {};
-var debugInt, flushInt, keyFlushInt, server, mgmtServer;
+var pctThreshold = null;
+var debugInt, flushInterval, keyFlushInt, server, mgmtServer;
 var startup_time = Math.round(new Date().getTime() / 1000);
+var backendEvents = new events.EventEmitter();
 var special_prefixes = false;
 
+// Load and init the backend from the backends/ directory.
+function loadBackend(config, name) {
+  var backendmod = require("./backends/" + name);
+
+  if (config.debug) {
+    util.log("Loading backend: " + name);
+  }
+
+  var ret = backendmod.init(startup_time, config, backendEvents);
+  if (!ret) {
+    util.log("Failed to load backend: " + name);
+    process.exit(1);
+  }
+};
+
+// Flush metrics to each backend.
+function flushMetrics() {
+  var time_stamp = Math.round(new Date().getTime() / 1000);
+
+  var metrics_hash = {
+    counters: counters,
+    raws: raws,
+    averages: averages,
+    gauges: gauges,
+    timers: timers,
+    pctThreshold: pctThreshold
+  }
+
+  // After all listeners, reset the stats
+  backendEvents.once('flush', function clear_metrics(ts, metrics) {
+    // Clear the counters
+    for (key in metrics.counters) {
+      metrics.counters[key] = 0;
+    }
+
+    // Clear the timers
+    for (key in metrics.timers) {
+      metrics.timers[key] = [];
+    }
+    // Clear the raws
+    metrics.raws.length = 0
+  });
+
+  // Flush metrics to each backend.
+  backendEvents.emit('flush', time_stamp, metrics_hash);
+};
+
 var stats = {
-  graphite: {
-    last_flush: startup_time,
-    last_exception: startup_time
-  },
   messages: {
     last_msg_seen: startup_time,
     bad_lines_seen: 0,
@@ -37,28 +83,10 @@ config.configFile(process.argv[2], function (config, oldConfig) {
     debugInt = setInterval(function () {
       util.log("Counters:\n" + util.inspect(counters) +
                "\nTimers:\n" + util.inspect(timers) +
-               "\nRaws:\n" + util.inspect(raws) + 
-               "\nAverages:\n" + util.inspect(averages) + 
+               "\nRaws:\n" + util.inspect(raws) +
+               "\nAverages:\n" + util.inspect(averages) +
                "\nGauges:\n" + util.inspect(gauges));
     }, config.debugInterval || 10000);
-  }
-
-  if (config.hasOwnProperty('altPrefixList')) {
-      util.log("config.altPrefixList is: " + config.altPrefixList + "\n\n");
-      special_prefixes = true;
-  }
-  function matches_alt_prefix(key) {
-      use_alt_prefix = false
-      util.log("matches_alt_prefix: key: " + key + " and special_prefixes: " + special_prefixes);
-      if(special_prefixes) {
-          util.log("matches_alt_prefix: special_prefixes: " + special_prefixes);
-          config.altPrefixList.map( function (item) {
-                                        if(key.indexOf(item) == 0)  {
-                                            use_alt_prefix = true;
-                                        }           
-                                    });
-      }
-      return use_alt_prefix;
   }
 
   if (server === undefined) {
@@ -143,21 +171,40 @@ config.configFile(process.argv[2], function (config, oldConfig) {
 
             stream.write("uptime: " + uptime + "\n");
 
+            var stat_writer = function(group, metric, val) {
+              var delta;
+
+              if (metric.match("^last_")) {
+                delta = now - val;
+              }
+              else {
+                delta = val;
+              }
+
+              stream.write(group + "." + metric + ": " + delta + "\n");
+            };
+
+            // Loop through the base stats
             for (group in stats) {
               for (metric in stats[group]) {
-                var val;
-
-                if (metric.match("^last_")) {
-                  val = now - stats[group][metric];
-                }
-                else {
-                  val = stats[group][metric];
-                }
-
-                stream.write(group + "." + metric + ": " + val + "\n");
+                stat_writer(group, metric, stats[group][metric]);
               }
             }
-            stream.write("END\n\n");
+
+            backendEvents.once('status', function(writeCb) {
+              stream.write("END\n\n");
+            });
+
+            // Let each backend contribute its status
+            backendEvents.emit('status', function(err, name, stat, val) {
+              if (err) {
+                util.log("Failed to read stats for backend " +
+                         name + ": " + err);
+              } else {
+                stat_writer(name, stat, val);
+              }
+            });
+
             break;
 
           case "counters":
@@ -167,6 +214,16 @@ config.configFile(process.argv[2], function (config, oldConfig) {
 
           case "timers":
             stream.write(util.inspect(timers) + "\n");
+            stream.write("END\n\n");
+            break;
+
+          case "raws":
+            stream.write(util.inspect(raws) + "\n");
+            stream.write("END\n\n");
+            break;
+
+          case "averages":
+            stream.write(util.inspect(averages) + "\n");
             stream.write("END\n\n");
             break;
 
@@ -186,6 +243,22 @@ config.configFile(process.argv[2], function (config, oldConfig) {
           case "deltimers":
             for (index in cmdline) {
               delete timers[cmdline[index]];
+              stream.write("deleted: " + cmdline[index] + "\n");
+            }
+            stream.write("END\n\n");
+            break;
+
+          case "delraws":
+            for (index in cmdline) {
+              delete raws[cmdline[index]];
+              stream.write("deleted: " + cmdline[index] + "\n");
+            }
+            stream.write("END\n\n");
+            break;
+
+          case "delaverages":
+            for (index in cmdline) {
+              delete averages[cmdline[index]];
               stream.write("deleted: " + cmdline[index] + "\n");
             }
             stream.write("END\n\n");
@@ -216,152 +289,25 @@ config.configFile(process.argv[2], function (config, oldConfig) {
 
     util.log("server is up");
 
-    var flushInterval = Number(config.flushInterval || 10000);
-
-    var pctThreshold = config.percentThreshold || 90;
+    pctThreshold = config.percentThreshold || 90;
     if (!Array.isArray(pctThreshold)) {
       pctThreshold = [ pctThreshold ]; // listify percentiles so single values work the same
     }
 
-    flushInt = setInterval(function () {
-      var statString = '';
-      var ts = Math.round(new Date().getTime() / 1000);
-      var numStats = 0;
-      var key;
+    flushInterval = Number(config.flushInterval || 10000);
+    config.flushInterval = flushInterval;
 
-      for (key in counters) {
-        var value = counters[key];
-        var valuePerSecond = value / (flushInterval / 1000); // calculate "per second" rate
-
-        var use_alt_prefix = matches_alt_prefix(key)
-        if (use_alt_prefix) {
-            statString += key + ' ' + valuePerSecond + ' ' + ts + "\n";
-            statString += key + '_count ' + value          + ' ' + ts + "\n";
-        } else {
-            statString += 'stats.'        + key + ' ' + valuePerSecond + ' ' + ts + "\n";
-            statString += 'stats_counts.' + key + ' ' + value          + ' ' + ts + "\n";
-        }
-
-        counters[key] = 0;
-        numStats += 1;
+    if (config.backends) {
+      for (var i = 0; i < config.backends.length; i++) {
+        loadBackend(config, config.backends[i]);
       }
+    } else {
+      // The default backend is graphite
+      loadBackend(config, 'graphite');
+    }
 
-      for (idx in raws) {
-        statString += 'stats.' + raws[idx][0] + ' ' + raws[idx][1] + ' ' + raws[idx][2] + "\n";
-        numStats += 1;
-      }
-      raws = [];
-
-      for (key in averages) {
-        var vals = averages[key],
-            valCount = averages[key].length,
-            valTotal = 0;
-        if (vals.length >= 1) {
-          for (idx in vals) {
-            valTotal += vals[idx];
-          }
-          var averageVal = valTotal / valCount;
-          averages[key] = [];
-          statString += 'stats.' + key + ' ' + averageVal + ' ' + ts + "\n";
-          numStats += 1;
-        }
-      }
-
-      for (key in timers) {
-        if (timers[key].length > 0) {
-          var values = timers[key].sort(function (a,b) { return a-b; });
-          var count = values.length;
-          var min = values[0];
-          var max = values[count - 1];
-
-          var mean = min;
-          var maxAtThreshold = max;
-
-          var message = "";
-
-          var key2;
-
-          var use_alt_prefix = matches_alt_prefix(key)
-          for (key2 in pctThreshold) {
-            var pct = pctThreshold[key2];
-            if (count > 1) {
-              var thresholdIndex = Math.round(((100 - pct) / 100) * count);
-              var numInThreshold = count - thresholdIndex;
-              var pctValues = values.slice(0, numInThreshold);
-              maxAtThreshold = pctValues[numInThreshold - 1];
-
-              // average the remaining timings
-              var sum = 0;
-              for (var i = 0; i < numInThreshold; i++) {
-                sum += pctValues[i];
-              }
-
-              mean = sum / numInThreshold;
-            }
-
-            var clean_pct = '' + pct;
-            clean_pct.replace('.', '_');
-            if (use_alt_prefix) {
-                message += key + '.mean_'  + clean_pct + ' ' + mean           + ' ' + ts + "\n";
-                message += key + '.upper_' + clean_pct + ' ' + maxAtThreshold + ' ' + ts + "\n";
-            } else {
-                message += 'stats.timers.' + key + '.mean_'  + clean_pct + ' ' + mean           + ' ' + ts + "\n";
-                message += 'stats.timers.' + key + '.upper_' + clean_pct + ' ' + maxAtThreshold + ' ' + ts + "\n";
-            }
-          }
-
-          timers[key] = [];
-
-          if (use_alt_prefix) {
-              message += key + '.upper ' + max   + ' ' + ts + "\n";
-              message += key + '.lower ' + min   + ' ' + ts + "\n";
-              message += key + '.count ' + count + ' ' + ts + "\n";
-          } else {
-              message += 'stats.timers.' + key + '.upper ' + max   + ' ' + ts + "\n";
-              message += 'stats.timers.' + key + '.lower ' + min   + ' ' + ts + "\n";
-              message += 'stats.timers.' + key + '.count ' + count + ' ' + ts + "\n";
-          }
-
-          statString += message;
-
-          numStats += 1;
-        }
-      }
-
-      for (key in gauges) {
-        var use_alt_prefix = matches_alt_prefix(key)
-        if (use_alt_prefix) {
-            statString += key + ' ' + gauges[key] + ' ' + ts + "\n";
-        } else {
-            statString += 'stats.gauges.' + key + ' ' + gauges[key] + ' ' + ts + "\n";
-        }
-        numStats += 1;
-      }
-
-      statString += 'statsd.numStats ' + numStats + ' ' + ts + "\n";
-
-      if (config.graphiteHost) {
-        try {
-          var graphite = net.createConnection(config.graphitePort, config.graphiteHost);
-          graphite.addListener('error', function(connectionException){
-            if (config.debug) {
-              util.log(connectionException);
-            }
-          });
-          graphite.on('connect', function() {
-            this.write(statString);
-            this.end();
-            stats['graphite']['last_flush'] = Math.round(new Date().getTime() / 1000);
-          });
-        } catch(e){
-          if (config.debug) {
-            util.log(e);
-          }
-          stats['graphite']['last_exception'] = Math.round(new Date().getTime() / 1000);
-        }
-      }
-
-    }, flushInterval);
+    // Setup the flush timer
+    var flushInt = setInterval(flushMetrics, flushInterval);
 
     if (keyFlushInterval > 0) {
       var keyFlushPercent = Number((config.keyFlush && config.keyFlush.percent) || 100);
@@ -393,8 +339,7 @@ config.configFile(process.argv[2], function (config, oldConfig) {
         keyCounter = {};
       }, keyFlushInterval);
     }
+  ;
 
   }
-});
-
-
+})
