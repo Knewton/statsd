@@ -96,7 +96,8 @@ var flush_stats = function graphite_flush(ts, metrics) {
   for (idx in raws) {
     var use_alt_prefix = matches_alt_prefix(key)
     if (use_alt_prefix) {
-        statString += key + ' ' + raws[idx][0] + ' ' + raws[idx][1] + ' ' + raws[idx][2] + "\n";     } else {
+        statString += raws[idx][0] + ' ' + raws[idx][1] + ' ' + raws[idx][2] + "\n";     
+    } else {
         statString += 'stats.' + raws[idx][0] + ' ' + raws[idx][1] + ' ' + raws[idx][2] + "\n";
     }
     numStats += 1;
@@ -192,6 +193,8 @@ var flush_stats = function graphite_flush(ts, metrics) {
   }
 
   statString += 'statsd.numStats ' + numStats + ' ' + ts + "\n";
+
+  util.log(statString);
   post_stats(statString);
 };
 
