@@ -25,17 +25,29 @@ var altPrefixList;
 var graphiteStats = {};
 
 function matches_alt_prefix(key) {
-      var use_alt_prefix = false
-      util.log("matches_alt_prefix: key: " + key + " and special_prefixes: " + special_prefixes);
-      if(special_prefixes) {
-          util.log("matches_alt_prefix: special_prefixes: " + special_prefixes);
-          altPrefixList.map( function (item) {
-                                        if(key.indexOf(item) == 0)  {
-                                            use_alt_prefix = true;
-                                        }           
-                                    });
-      }
-      return use_alt_prefix;
+    var use_alt_prefix = false;
+    if (undefined == key) {
+	return false;
+    }
+    // util.log("matches_alt_prefix: key: " + key + " and special_prefixes: " + special_prefixes);
+    // util.log("altPrefixList: " + altPrefixList);
+    if(special_prefixes) {
+        // util.log("matches_alt_prefix: special_prefixes: " + special_prefixes);
+        // altPrefixList.map( function (item) {
+	// 	if(key.indexOf(item) == 0)  {
+	// 	    use_alt_prefix = true;
+	// 	}           
+	//     });
+	for(var test_val in altPrefixList) {
+	    if(key.indexOf(altPrefixList[test_val]) == 0) {
+		// util.log("Matched " + key + " with " + altPrefixList[test_val])
+		return true;
+	    //} else {
+		// util.log("No match " + key + " with " + altPrefixList[test_val]);
+	    }
+	}
+    }
+    return use_alt_prefix;
 }
 
 
@@ -94,7 +106,7 @@ var flush_stats = function graphite_flush(ts, metrics) {
   }
 
   for (idx in raws) {
-    var use_alt_prefix = matches_alt_prefix(key)
+    var use_alt_prefix = matches_alt_prefix(raws[idx][0])
     if (use_alt_prefix) {
         statString += raws[idx][0] + ' ' + raws[idx][1] + ' ' + raws[idx][2] + "\n";     
     } else {
