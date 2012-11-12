@@ -206,7 +206,9 @@ var flush_stats = function graphite_flush(ts, metrics) {
 
   statString += 'statsd.numStats ' + numStats + ' ' + ts + "\n";
 
-  util.log(statString);
+  if (debug) {
+    util.log(statString);
+  }
   post_stats(statString);
 };
 
